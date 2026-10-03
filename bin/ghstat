@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""ghstat —— 一次看清一组本地仓库相对 GitHub 的真实状态。
+
+存在理由：单仓库 `git status` 看不出「哪个仓库忘了推」。五个仓库各跑一次
+是在拼手工，不是流程。这个脚本把「记得去看」从人的自觉变成一条命令。
+
+只读。不 fetch、不改任何仓库状态、不写任何文件。
+
+用法：
+    ghstat                          # 扫默认根目录下的所有 git 仓库
+    ghstat -p ~/code -p /Volumes/X  # 指定扫描根（可重复）
+    ghstat --json                   # 机器可读
+    ghstat --no-pr                  # 跳过 gh 网络查询，离线可用
+    ghstat --check                  # 只在有漂移时非零退出，供冒烟/钩子用
+
+输出字段：
+    repo      仓库目录名
+    branch    当前分支（detached 时标出）
+    ↑↓        ahead/behind（相对 upstream；无 upstream 则相对 origin 的默认分支）
+    dirty     未提交文件数（含未跟踪）
+    pr        open PR 数（gh 查得，--no-pr 时为 -）
+    fork      远端是否分叉（有 fork 远端，或 origin 与其它远端不同属主）
+    最后提交   相对时间 + 作者
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+CONFIG_FILE = Path.home() / ".config" / "ghstat" / "roots"
+FALLBACK_ROOTS = [Path.home() / "code", Path("/Volumes/Data")]
+
+
+def default_roots() -> list[Path]:
+    """默认扫描根：优先读配置文件，一行一个路径，# 开头为注释。
+
+    为什么要配置文件：默认根写死在脚本里，加一块盘就得改代码。反过来若
+    写死成只扫某一个目录，会出现「跑了一遍没找到仓库」这种假阴性——那比
+    不跑更坏，因为它让人以为干净。
+    """
+    if CONFIG_FILE.is_file():
+        roots = []
+        for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                roots.append(Path(line).expanduser())
+        if roots:
+            return roots
+    return FALLBACK_ROOTS
+
+# gh 查询单仓库的超时。网络不通时不能让整个扫描卡住。
+PR_TIMEOUT = 20
+GIT_TIMEOUT = 15
+
+
+# ---------------------------------------------------------------- 基础工具
+
+
+def _run(cmd: list[str], cwd: str | None = None, timeout: int = GIT_TIMEOUT) -> str:
+    """跑一条命令，失败一律返回空串。
+
+    这是刻意的：扫描工具的价值在于「有结果」，某个仓库的某个字段拿不到
+    不应该让整张表消失。拿不到的字段会显示为 -，由人判断是否要紧。
+    """
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            errors="replace",
+        )
+        return p.stdout if p.returncode == 0 else ""
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return ""
+
+
+def _width(s: str) -> int:
+    """计算终端显示宽度。仓库名里有中日韩字符时 len() 会让表格错位。"""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def _pad(s: str, width: int, align: str = "left") -> str:
+    gap = max(0, width - _width(s))
+    return s + " " * gap if align == "left" else " " * gap + s
+
+
+def _rel_time(epoch: int) -> str:
+    d = max(0, int(time.time()) - epoch)
+    if d < 3600:
+        return f"{d // 60}分钟前"
+    if d < 86400:
+        return f"{d // 3600}小时前"
+    if d < 86400 * 30:
+        return f"{d // 86400}天前"
+    if d < 86400 * 365:
+        return f"{d // (86400 * 30)}个月前"
+    return f"{d // (86400 * 365)}年前"
+
+
+# ---------------------------------------------------------------- 远端解析
+
+
+def parse_remote(url: str) -> tuple[str, str] | None:
+    """从 git remote URL 取出 (owner, repo)。非 GitHub 返回 None。"""
+    if not url:
+        return None
+    m = re.search(r"github\.com[:/]+([^/]+)/(.+?)(?:\.git)?/?$", url.strip())
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+# ---------------------------------------------------------------- 单仓库扫描
+
+
+def scan_repo(path: Path, want_pr: bool) -> dict:
+    r = str(path)
+    info: dict = {"repo": path.name, "path": r}
+
+    branch = _run(["git", "-C", r, "rev-parse", "--abbrev-ref", "HEAD"]).strip()
+    info["branch"] = branch or "?"
+
+    # ahead/behind：优先 upstream，没有则退回 origin 的默认分支
+    base = None
+    counts = _run(["git", "-C", r, "rev-list", "--left-right", "--count", "@{u}...HEAD"]).strip()
+    if counts:
+        behind, ahead = (int(x) for x in counts.split())
+        base = "@{u}"
+    else:
+        head_ref = _run(
+            ["git", "-C", r, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]
+        ).strip()
+        if head_ref:
+            cand = head_ref.replace("refs/remotes/", "")
+            counts = _run(
+                ["git", "-C", r, "rev-list", "--left-right", "--count", f"{cand}...HEAD"]
+            ).strip()
+            if counts:
+                behind, ahead = (int(x) for x in counts.split())
+                base = cand
+    if base is None:
+        info["ahead"] = info["behind"] = None
+        info["base"] = None
+    else:
+        info["ahead"], info["behind"], info["base"] = ahead, behind, base
+
+    porcelain = _run(["git", "-C", r, "status", "--porcelain"])
+    info["dirty"] = len([ln for ln in porcelain.splitlines() if ln.strip()])
+
+    last = _run(["git", "-C", r, "log", "-1", "--format=%ct%x09%an"]).strip()
+    if last:
+        ts, _, author = last.partition("\t")
+        try:
+            info["last_commit_ts"] = int(ts)
+            info["last_commit_rel"] = _rel_time(int(ts))
+            info["last_commit_author"] = author
+        except ValueError:
+            info["last_commit_ts"] = None
+    else:
+        info["last_commit_ts"] = None
+
+    # 远端与分叉判定
+    remotes = _run(["git", "-C", r, "remote"]).split()
+    info["remotes"] = remotes
+    origin_url = _run(["git", "-C", r, "remote", "get-url", "origin"]).strip()
+    info["origin"] = origin_url
+    parsed = parse_remote(origin_url)
+    info["slug"] = f"{parsed[0]}/{parsed[1]}" if parsed else None
+
+    fork = False
+    if "fork" in remotes:
+        fork = True
+    elif parsed:
+        owners = set()
+        for rm in remotes:
+            u = _run(["git", "-C", r, "remote", "get-url", rm]).strip()
+            pr = parse_remote(u)
+            if pr:
+                owners.add(pr[0])
+        if len(owners) > 1:
+            fork = True
+    info["fork"] = fork
+
+    # open PR 数（网络）
+    info["open_pr"] = None
+    if want_pr and info["slug"]:
+        out = _run(
+            ["gh", "pr", "list", "-R", info["slug"], "--state", "open",
+             "--json", "number", "-q", "length"],
+            timeout=PR_TIMEOUT,
+        ).strip()
+        if out.isdigit():
+            info["open_pr"] = int(out)
+
+    return info
+
+
+# ---------------------------------------------------------------- 发现仓库
+
+
+def discover(roots: list[Path], depth: int) -> list[Path]:
+    found: list[Path] = []
+    seen: set[str] = set()
+
+    def consider(p: Path) -> None:
+        key = str(p.resolve())
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(p)
+
+    for root in roots:
+        if not root.is_dir():
+            continue
+        if (root / ".git").exists():
+            consider(root)
+            # 命中根本身就是仓库时不再往下钻，避免把它的子模块当成独立仓库
+            continue
+        consider_root = root
+        for cur, dirs, _files in os.walk(consider_root):
+            curp = Path(cur)
+            try:
+                rel_depth = len(curp.relative_to(consider_root).parts)
+            except ValueError:
+                continue
+            if rel_depth > depth:
+                dirs[:] = []
+                continue
+            if ".git" in dirs or (curp / ".git").exists():
+                consider(curp)
+                dirs[:] = [d for d in dirs if d != ".git"]
+                continue
+            # 剪枝：常见的重目录不进
+            dirs[:] = [
+                d for d in dirs
+                if d not in {"node_modules", ".venv", "venv", "__pycache__",
+                             "dist", "build", ".next", "target", ".Trash"}
+            ]
+    return sorted(found)
+
+
+# ---------------------------------------------------------------- 渲染
+
+
+def render(rows: list[dict], roots: list[Path]) -> str:
+    if not rows:
+        return f"没有找到 git 仓库（扫描根：{', '.join(str(r) for r in roots)}）"
+
+    cols = ["repo", "branch", "↑↓", "dirty", "pr", "fork", "最后提交"]
+    widths = {}
+    table = []
+    for r in rows:
+        ab = "-" if r["ahead"] is None else f"{r['ahead']}/{r['behind']}"
+        pr = "-" if r["open_pr"] is None else str(r["open_pr"])
+        last = (
+            f"{r.get('last_commit_rel', '-')} · {r.get('last_commit_author', '-')}"
+            if r.get("last_commit_ts")
+            else "-"
+        )
+        line = [
+            r["repo"],
+            r["branch"],
+            ab,
+            str(r["dirty"]),
+            pr,
+            "fork" if r["fork"] else "",
+            last,
+        ]
+        table.append(line)
+
+    for i, c in enumerate(cols):
+        widths[c] = max(_width(c), max(_width(row[i]) for row in table))
+
+    out = ["  ".join(_pad(c, widths[c]) for c in cols).rstrip()]
+    out.append("  ".join("-" * widths[c] for c in cols))
+    for row in table:
+        out.append("  ".join(_pad(v, widths[c]) for v, c in zip(row, cols)).rstrip())
+
+    drift = [r for r in rows if (r["ahead"] or 0) > 0 or r["dirty"] > 0]
+    if drift:
+        out.append("")
+        out.append(f"需要处理 {len(drift)} 个：")
+        for r in drift:
+            bits = []
+            if r["ahead"]:
+                bits.append(f"领先 {r['ahead']} 个提交未推")
+            if r["dirty"]:
+                bits.append(f"{r['dirty']} 个文件未提交")
+            out.append(f"  {r['repo']}：{'，'.join(bits)}")
+    else:
+        out.append("")
+        out.append("全部干净。")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- 入口
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="ghstat",
+        description="一次看清一组本地仓库相对 GitHub 的状态（只读）",
+    )
+    ap.add_argument("-p", "--path", action="append", default=None,
+                    help="扫描根目录，可重复。默认读 ~/.config/ghstat/roots，无此文件时扫 ~/code 与 /Volumes/Data")
+    ap.add_argument("--json", action="store_true", help="输出 JSON")
+    ap.add_argument("--no-pr", action="store_true", help="跳过 gh 网络查询")
+    ap.add_argument("--depth", type=int, default=2, help="仓库发现深度，默认 2")
+    ap.add_argument("--check", action="store_true",
+                    help="有漂移（领先或脏）时退出码 1，供脚本/钩子使用")
+    args = ap.parse_args()
+
+    roots = [Path(p).expanduser() for p in args.path] if args.path else default_roots()
+    repos = discover(roots, args.depth)
+    want_pr = not args.no_pr and bool(_run(["which", "gh"]).strip())
+
+    if repos:
+        with ThreadPoolExecutor(max_workers=min(8, len(repos))) as ex:
+            rows = list(ex.map(lambda p: scan_repo(p, want_pr), repos))
+    else:
+        rows = []
+
+    if args.json:
+        print(json.dumps({"roots": [str(r) for r in roots], "repos": rows},
+                         ensure_ascii=False, indent=2))
+    else:
+        print(render(rows, roots))
+
+    if args.check and any((r["ahead"] or 0) > 0 or r["dirty"] > 0 for r in rows):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
