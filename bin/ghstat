@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
 """ghstat —— 一次看清一组本地仓库相对 GitHub 的真实状态。
 
-存在理由：单仓库 `git status` 看不出「哪个仓库忘了推」。五个仓库各跑一次
+存在理由：单仓库 `git status` 看不出「哪个仓库忘了推」。六个仓库各跑一次
 是在拼手工，不是流程。这个脚本把「记得去看」从人的自觉变成一条命令。
 
-只读。不 fetch、不改任何仓库状态、不写任何文件。
+默认只读：不写文件、不动工作树、不改远端引用。只有 `--fetch` 会写，且只
+更新远端引用。
 
 用法：
     ghstat                          # 扫默认根目录下的所有 git 仓库
     ghstat -p ~/code -p /Volumes/X  # 指定扫描根（可重复）
+    ghstat --fetch                  # 先 fetch --all --prune 再扫描
     ghstat --json                   # 机器可读
     ghstat --no-pr                  # 跳过 gh 网络查询，离线可用
     ghstat --check                  # 只在有漂移时非零退出，供冒烟/钩子用
 
 输出字段：
     repo      仓库目录名
-    branch    当前分支（detached 时标出）
-    ↑↓        ahead/behind（相对 upstream；无 upstream 则相对 origin 的默认分支）
+    branch    当前分支
+    ↑↓        ahead/behind，基准是「上游集成分支」——fork 工作流里即
+              origin 的默认分支，也就是 PR 要合进去的那条
     dirty     未提交文件数（含未跟踪）
     pr        open PR 数（gh 查得，--no-pr 时为 -）
-    fork      远端是否分叉（有 fork 远端，或 origin 与其它远端不同属主）
+    标记      fork（远端分叉）、fork主落后N（fork 的 main 落后上游 N 个提交）
     最后提交   相对时间 + 作者
+
+为什么 ↑↓ 不以「本地分支跟踪谁」为基准：fork 工作流里本地分支常跟踪
+fork/main，而 fork/main 可能几周没同步。那样算出来的 ahead/behind 会显示
+「领先 1 落后 1」，掩盖了真正的问题——分支的基线已经落后上游几百个提交。
 """
 
 from __future__ import annotations
@@ -60,6 +67,8 @@ def default_roots() -> list[Path]:
 # gh 查询单仓库的超时。网络不通时不能让整个扫描卡住。
 PR_TIMEOUT = 20
 GIT_TIMEOUT = 15
+# fetch 走网络，给得比本地命令宽一些。
+FETCH_TIMEOUT = 90
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -131,29 +140,76 @@ def scan_repo(path: Path, want_pr: bool) -> dict:
     branch = _run(["git", "-C", r, "rev-parse", "--abbrev-ref", "HEAD"]).strip()
     info["branch"] = branch or "?"
 
-    # ahead/behind：优先 upstream，没有则退回 origin 的默认分支
-    base = None
-    counts = _run(["git", "-C", r, "rev-list", "--left-right", "--count", "@{u}...HEAD"]).strip()
+    # ---------------------------------------------------------- 远端与分叉
+    # 先解析远端，因为主线比较的基准取决于哪个远端是「上游」。
+    remotes = _run(["git", "-C", r, "remote"]).split()
+    info["remotes"] = remotes
+    urls = {rm: _run(["git", "-C", r, "remote", "get-url", rm]).strip() for rm in remotes}
+    parsed_urls = {rm: parse_remote(u) for rm, u in urls.items()}
+    owners = {p[0] for p in parsed_urls.values() if p}
+
+    origin_url = urls.get("origin", "")
+    info["origin"] = origin_url
+    origin_parsed = parsed_urls.get("origin")
+    info["slug"] = f"{origin_parsed[0]}/{origin_parsed[1]}" if origin_parsed else None
+
+    # 上游远端的判定：有名为 fork 的远端时它显然不是上游；否则取 origin。
+    # 「分叉」指存在一个 owner 与上游不同的远端——不是指远端名字叫 fork。
+    if "fork" in remotes:
+        upstream_remote = "origin"
+    else:
+        upstream_remote = "origin" if "origin" in remotes else (remotes[0] if remotes else None)
+    info["upstream_remote"] = upstream_remote
+    info["fork"] = len(owners) > 1 or "fork" in remotes
+
+    upstream_head = _run(
+        ["git", "-C", r, "symbolic-ref", "--quiet", f"refs/remotes/{upstream_remote}/HEAD"]
+    ).strip()
+    upstream_main = (
+        upstream_head.replace("refs/remotes/", "")
+        if upstream_head
+        else (f"{upstream_remote}/main" if upstream_remote else None)
+    )
+    info["upstream_main"] = upstream_main
+    if upstream_main and not _run(["git", "-C", r, "rev-parse", "--verify", "--quiet", upstream_main]).strip():
+        upstream_main = None
+        info["upstream_main"] = None
+
+    # ---------------------------------------------------------- 主线差距
+    # fork 工作流里当前分支是拿去做 PR 的，所以有意义的问题是
+    # 「相对上游集成分支领先/落后多少」——本地分支跟踪谁无关。
+    base = upstream_main
+    if base is None:
+        track = _run(["git", "-C", r, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).strip()
+        base = track or None
+    counts = (
+        _run(["git", "-C", r, "rev-list", "--left-right", "--count", f"{base}...HEAD"]).strip()
+        if base
+        else ""
+    )
     if counts:
         behind, ahead = (int(x) for x in counts.split())
-        base = "@{u}"
-    else:
-        head_ref = _run(
-            ["git", "-C", r, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]
-        ).strip()
-        if head_ref:
-            cand = head_ref.replace("refs/remotes/", "")
-            counts = _run(
-                ["git", "-C", r, "rev-list", "--left-right", "--count", f"{cand}...HEAD"]
-            ).strip()
-            if counts:
-                behind, ahead = (int(x) for x in counts.split())
-                base = cand
-    if base is None:
-        info["ahead"] = info["behind"] = None
-        info["base"] = None
-    else:
         info["ahead"], info["behind"], info["base"] = ahead, behind, base
+    else:
+        info["ahead"] = info["behind"] = info["base"] = None
+
+    # 分支自己跟踪谁、是否落后——这是与主线差距不同的另一件事
+    track_ref = _run(
+        ["git", "-C", r, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]
+    ).strip()
+    info["tracking"] = track_ref or None
+    if track_ref and track_ref != base:
+        tc = _run(["git", "-C", r, "rev-list", "--left-right", "--count", f"{track_ref}...HEAD"]).strip()
+        if tc:
+            t_behind, t_ahead = (int(x) for x in tc.split())
+            info["track_behind"], info["track_ahead"] = t_behind, t_ahead
+    # 本地跟踪的 main 是否已经落后上游 main（fork 的 main 常常如此）
+    if upstream_main and "fork" in remotes:
+        fm = f"fork/{upstream_main.split('/', 1)[1]}"
+        if _run(["git", "-C", r, "rev-parse", "--verify", "--quiet", fm]).strip():
+            fc = _run(["git", "-C", r, "rev-list", "--left-right", "--count", f"{upstream_main}...{fm}"]).strip()
+            if fc:
+                info["fork_main_behind"] = int(fc.split()[0])
 
     porcelain = _run(["git", "-C", r, "status", "--porcelain"])
     info["dirty"] = len([ln for ln in porcelain.splitlines() if ln.strip()])
@@ -169,28 +225,6 @@ def scan_repo(path: Path, want_pr: bool) -> dict:
             info["last_commit_ts"] = None
     else:
         info["last_commit_ts"] = None
-
-    # 远端与分叉判定
-    remotes = _run(["git", "-C", r, "remote"]).split()
-    info["remotes"] = remotes
-    origin_url = _run(["git", "-C", r, "remote", "get-url", "origin"]).strip()
-    info["origin"] = origin_url
-    parsed = parse_remote(origin_url)
-    info["slug"] = f"{parsed[0]}/{parsed[1]}" if parsed else None
-
-    fork = False
-    if "fork" in remotes:
-        fork = True
-    elif parsed:
-        owners = set()
-        for rm in remotes:
-            u = _run(["git", "-C", r, "remote", "get-url", rm]).strip()
-            pr = parse_remote(u)
-            if pr:
-                owners.add(pr[0])
-        if len(owners) > 1:
-            fork = True
-    info["fork"] = fork
 
     # open PR 数（网络）
     info["open_pr"] = None
@@ -253,11 +287,11 @@ def discover(roots: list[Path], depth: int) -> list[Path]:
 # ---------------------------------------------------------------- 渲染
 
 
-def render(rows: list[dict], roots: list[Path]) -> str:
+def render(rows: list[dict], roots: list[Path], fetched: str | None = None) -> str:
     if not rows:
         return f"没有找到 git 仓库（扫描根：{', '.join(str(r) for r in roots)}）"
 
-    cols = ["repo", "branch", "↑↓", "dirty", "pr", "fork", "最后提交"]
+    cols = ["repo", "branch", "↑↓", "dirty", "pr", "标记", "最后提交"]
     widths = {}
     table = []
     for r in rows:
@@ -268,13 +302,18 @@ def render(rows: list[dict], roots: list[Path]) -> str:
             if r.get("last_commit_ts")
             else "-"
         )
+        marks = []
+        if r["fork"]:
+            marks.append("fork")
+        if r.get("fork_main_behind"):
+            marks.append(f"fork主落后{r['fork_main_behind']}")
         line = [
             r["repo"],
             r["branch"],
             ab,
             str(r["dirty"]),
             pr,
-            "fork" if r["fork"] else "",
+            " ".join(marks),
             last,
         ]
         table.append(line)
@@ -287,6 +326,16 @@ def render(rows: list[dict], roots: list[Path]) -> str:
     for row in table:
         out.append("  ".join(_pad(v, widths[c]) for v, c in zip(row, cols)).rstrip())
 
+    # 比较基准来自第一个仓库——同一次扫描里只列一个基准，避免读者误以为
+    # 每个仓库的 ↑↓ 都是相对自己跟踪的分支。
+    bases = {r.get("base") for r in rows if r.get("base")}
+    out.append("")
+    out.append(f"↑↓ 基准：{', '.join(sorted(bases))}" if bases else "↑↓ 基准：无（没有可用远端引用）")
+    if fetched:
+        out.append(f"已 fetch：{fetched}")
+    else:
+        out.append("未 fetch（远端引用可能过期，加 --fetch 取最新）")
+
     drift = [r for r in rows if (r["ahead"] or 0) > 0 or r["dirty"] > 0]
     if drift:
         out.append("")
@@ -294,14 +343,51 @@ def render(rows: list[dict], roots: list[Path]) -> str:
         for r in drift:
             bits = []
             if r["ahead"]:
-                bits.append(f"领先 {r['ahead']} 个提交未推")
+                bits.append(f"相对 {r.get('base') or '远端'} 领先 {r['ahead']} 个提交未推")
             if r["dirty"]:
                 bits.append(f"{r['dirty']} 个文件未提交")
             out.append(f"  {r['repo']}：{'，'.join(bits)}")
-    else:
+
+    stale = [r for r in rows if r.get("fork_main_behind")]
+    if stale:
+        out.append("")
+        out.append("fork 的 main 落后上游（不影响当前分支，但别拿它当新分支的基线）：")
+        for r in stale:
+            out.append(f"  {r['repo']}：fork/main 落后 {r['upstream_main']} {r['fork_main_behind']} 个提交")
+
+    if not drift and not stale:
         out.append("")
         out.append("全部干净。")
     return "\n".join(out)
+
+
+# ---------------------------------------------------------------- fetch
+
+
+def fetch_all(repos: list[Path]) -> tuple[str, list[str]]:
+    """对每个仓库 fetch --all --prune，返回 (摘要, 失败明细)。
+
+    为什么单独做一层而不是塞进 scan_repo：fetch 会改写远端引用，是这个脚本里
+    唯一的副作用。让它显式、集中、失败可见。塞进并发扫描里，一个仓库的 fetch
+    失败会变成「字段显示 -」，看不出是网络问题还是真的没有上游。
+    """
+    ok, failed = 0, []
+    for p in repos:
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(p), "fetch", "--all", "--prune", "--quiet"],
+                capture_output=True, text=True, timeout=FETCH_TIMEOUT, errors="replace",
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            failed.append(f"{p.name}: {type(e).__name__}")
+            continue
+        if r.returncode == 0:
+            ok += 1
+        else:
+            first = (r.stderr or "").strip().splitlines()
+            failed.append(f"{p.name}: {first[0] if first else '未知错误'}")
+    summary = f"{ok}/{len(repos)} 个仓库成功"
+    return summary, failed
 
 
 # ---------------------------------------------------------------- 入口
@@ -310,13 +396,17 @@ def render(rows: list[dict], roots: list[Path]) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="ghstat",
-        description="一次看清一组本地仓库相对 GitHub 的状态（只读）",
+        description="一次看清一组本地仓库相对 GitHub 的状态",
     )
     ap.add_argument("-p", "--path", action="append", default=None,
                     help="扫描根目录，可重复。默认读 ~/.config/ghstat/roots，无此文件时扫 ~/code 与 /Volumes/Data")
     ap.add_argument("--json", action="store_true", help="输出 JSON")
     ap.add_argument("--no-pr", action="store_true", help="跳过 gh 网络查询")
     ap.add_argument("--depth", type=int, default=2, help="仓库发现深度，默认 2")
+    ap.add_argument("--fetch", action="store_true",
+                    help="先对每个仓库 fetch --all --prune 再扫描。这是唯一的写动作"
+                         "（只更新远端引用，不动工作树）。不 fetch 时 ahead/behind "
+                         "相对的是上次 fetch 时的远端状态")
     ap.add_argument("--check", action="store_true",
                     help="有漂移（领先或脏）时退出码 1，供脚本/钩子使用")
     args = ap.parse_args()
@@ -325,6 +415,10 @@ def main() -> int:
     repos = discover(roots, args.depth)
     want_pr = not args.no_pr and bool(_run(["which", "gh"]).strip())
 
+    fetch_summary, fetch_failures = (None, [])
+    if args.fetch and repos:
+        fetch_summary, fetch_failures = fetch_all(repos)
+
     if repos:
         with ThreadPoolExecutor(max_workers=min(8, len(repos))) as ex:
             rows = list(ex.map(lambda p: scan_repo(p, want_pr), repos))
@@ -332,10 +426,18 @@ def main() -> int:
         rows = []
 
     if args.json:
-        print(json.dumps({"roots": [str(r) for r in roots], "repos": rows},
-                         ensure_ascii=False, indent=2))
+        print(json.dumps(
+            {"roots": [str(r) for r in roots], "fetched": fetch_summary,
+             "fetch_failures": fetch_failures, "repos": rows},
+            ensure_ascii=False, indent=2,
+        ))
     else:
-        print(render(rows, roots))
+        print(render(rows, roots, fetched=fetch_summary))
+        if fetch_failures:
+            print()
+            print("fetch 失败：")
+            for f in fetch_failures:
+                print(f"  {f}")
 
     if args.check and any((r["ahead"] or 0) > 0 or r["dirty"] > 0 for r in rows):
         return 1

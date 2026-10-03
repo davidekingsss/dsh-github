@@ -14,13 +14,14 @@ description: 处理本机多个 git 仓库相对 GitHub 的流程——先前状
 ## 第一步：先看状态，别问
 
 ```bash
-/Volumes/Data/Deepseek Harness/dsh-github/bin/ghstat -p "/Volumes/Data/Deepseek Harness"
+/Volumes/Data/Deepseek Harness/dsh-github/bin/ghstat --fetch
 ```
 
 任何 git 动作之前先跑这条。它的输出就是判断依据，不需要再逐仓库 `git status`。
 
-- `↑↓` 是相对 upstream 的 ahead/behind。没有 upstream 时退回 origin 的默认分支，此时 `↑` 是「相对远端默认分支领先几个提交」，含义仍是「没推上去的东西」。
-- `fork` 标记表示该仓库的远端分叉：有名为 `fork` 的远端，或 origin 与其它远端属主不同。**这类仓库的 push 目标和 PR 目标要对准，不要推到 upstream 去。**
+- `↑↓` 的基准是**上游集成分支**（fork 工作流里即 `origin` 的默认分支，PR 要合进去的那条），不是「本地分支跟踪谁」。表尾会写明本次基准。
+- 不带 `--fetch` 时远端引用可能过期，输出里会明说。要看真实差距就带 `--fetch`（只更新远端引用，不动工作树）。
+- `fork` 标记表示远端分叉。`fork主落后N` 表示 fork 的 main 落后上游 N 个提交——**这种仓库绝不能用 fork/main 当新分支的基线**，否则 PR 会带一堆无关提交。
 - `dirty` 含未跟踪文件。
 - 加 `--check` 时，有漂移就返回退出码 1，可用于钩子。
 - 加 `--no-pr` 可离线跑（跳过 `gh` 网络查询）。
@@ -114,30 +115,45 @@ gh pr create --repo <upstream-owner>/<repo> --head <your-owner>:<branch> ...
 
 ## fork 仓库与上游同步
 
-`ghstat` 里出现 `↑↓` 同时非零（例如 `1/1`）就说明 fork 落后上游并且本地有未推提交。处理顺序：
+本机只有一个这种仓库：`dsh-mneme`。
+
+它的形态要记清楚，因为它和「自己的仓库」完全不同：
+
+| 项 | 值 |
+|---|---|
+| 上游 | `slow-stack/mneme`（远端名 `origin`）。曾用名 `modusensus/dsh-mneme`，是重命名重定向，同一个仓库 |
+| 你的 fork | `davidekingsss/dsh-mneme`（远端名 `fork`）——**仅用于提交 PR** |
+| 你的角色 | 临时参与维护，不是作者 |
+| 上游 issues | 开着；但 fork 侧 issues 关闭，只能在 fork 提 PR，不能在 fork 开 issue |
+
+三条纪律：
+
+1. **新分支从上游开，不从 fork/main 开。** fork/main 长期落后上游（2026-10-03 时落后 222 个提交）。拿它当基线，PR 会带一堆无关提交。
+   ```bash
+   git -C dsh-mneme fetch --all --prune
+   git -C dsh-mneme switch -c fix/xxx origin/main
+   ```
+2. **不碰上游的 CHANGELOG 和版本号。** 那是维护者的发版流程，贡献者的改动由维护者在合并时整理。上游有 CONTRIBUTING，动手前先读。
+3. **PR 合并后删本地分支。** 已合并的分支堆着会让 `ghstat` 的分支列失去意义。
+
+同步本地分支到最新上游（rebase 属改写历史，**先问用户**）：
 
 ```bash
-git -C <repo> fetch fork
-git -C <repo> log --oneline HEAD..fork/main   # 看上游多了什么
+git -C dsh-mneme fetch --all --prune
+git -C dsh-mneme rebase origin/main   # 在当前特性分支上
 ```
 
-看了之后再决定。落后不等于必须马上同步；但**落后且准备开发新功能时先同步**，否则 PR 会带着一堆无关提交。
-
-同步用 rebase 把本地提交挪到上游之上，不要 merge（merge 会把上游全部历史搅进你的分支）：
-
-```bash
-git -C <repo> rebase fork/main
-```
-
-rebase 属改写历史，按上面的硬边界，**先问用户**。
-
-已合并的分支要删掉，本地和远端都删。堆积的已合并分支会让 `ghstat` 的分支列失去意义。
+自己的仓库（其余五个）落后就是落后，没有「上游」概念，`↑↓` 基准是自己的 origin。
 
 ## 动作速查
 
 ```bash
 # 状态（永远先跑）
-ghstat -p "/Volumes/Data/Deepseek Harness"
+ghstat --fetch
+
+# 从上游开新分支（fork 仓库如 dsh-mneme，先 fetch 再切）
+git -C <repo> fetch --all --prune
+git -C <repo> switch -c fix/xxx origin/main
 
 # 提交
 git -C <repo> add -A && git -C <repo> commit -m "type(scope): 描述"
@@ -162,7 +178,7 @@ gh pr merge <number> -R <slug> --squash --delete-branch
 
 ## 触发时机
 
-- 会话开始处理某个仓库的代码改动时：先 `ghstat`，看该仓库是不是落后上游、有没有未推内容。
-- 用户说「提交」「推送」「推上去」时：先 `ghstat`，再按硬边界确认内容，然后执行。
+- 会话开始处理某个仓库的代码改动时：先 `ghstat --fetch`，看该仓库是不是落后上游、有没有未推内容。
+- 用户说「提交」「推送」「推上去」时：先 `ghstat --fetch`，再按硬边界确认内容，然后执行。
 - 用户说「推到 GitHub」时：确认是推分支还是开 PR。含糊时问，不要猜。
-- 一次工作结束、要收尾时：跑一次 `ghstat --check`，把剩下的漂移报出来。
+- 一次工作结束、要收尾时：跑一次 `ghstat --fetch --check`，把剩下的漂移报出来。
